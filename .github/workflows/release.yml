@@ -3,6 +3,11 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create and release, e.g. v24.1.0-forge'
+        required: true
 permissions:
   contents: write
 jobs:
@@ -28,7 +33,10 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          name: CoreProtect ${{ github.ref_name }} for Forge 1.20.1
+          # A manual run creates the tag on the commit it was started from.
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          target_commitish: ${{ github.sha }}
+          name: CoreProtect ${{ inputs.tag || github.ref_name }} for Forge 1.20.1
           body_path: .github/release/notes.md
           files: build/libs/CoreProtect-*-forge.jar
           fail_on_unmatched_files: true
