@@ -1,646 +1,561 @@
 package net.coreprotect.consumer;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Types;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.LockSupport;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-
-import org.bukkit.Bukkit;
-import org.bukkit.block.BlockState;
-import org.bukkit.inventory.ItemStack;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import net.coreprotect.CoreProtect;
-import net.coreprotect.config.ConfigHandler;
-import net.coreprotect.consumer.process.Process;
 import net.coreprotect.database.Database;
-import net.coreprotect.database.DuckDBRecovery;
-import net.coreprotect.language.Phrase;
-import net.coreprotect.utility.Chat;
-import net.coreprotect.utility.Color;
-import net.coreprotect.utility.ErrorReporter;
+import net.coreprotect.utility.NbtCodec;
 
-public class Consumer extends Process implements Runnable, Thread.UncaughtExceptionHandler {
+/**
+ * Background writer. The server thread only enqueues immutable {@link Entry} objects; this thread resolves
+ * user/world/material ids and writes everything in batched transactions.
+ */
+public final class Consumer implements Runnable {
 
-    public enum OperationStartResult {
-        STARTED,
-        PURGE_RUNNING,
-        ROLLBACK_RUNNING,
-        RELOAD_RUNNING,
-        PERSISTENCE_HALTED,
-        INTERRUPTED
+    private static final int MAX_BATCH = 20_000;
+    private static final long IDLE_WAIT_MS = 500;
+
+    private final Database database;
+    private final ConcurrentLinkedQueue<Entry> queue = new ConcurrentLinkedQueue<>();
+    private final AtomicInteger queueSize = new AtomicInteger();
+    private final AtomicLong written = new AtomicLong();
+    private final Object signal = new Object();
+    private volatile boolean running = true;
+    private volatile boolean paused = false;
+    private volatile boolean flushRequested = false;
+    private Thread thread;
+    private Connection connection;
+
+    private final Map<String, Integer> worlds = new HashMap<>();
+    private final Map<String, Integer> materials = new HashMap<>();
+    private final Map<String, Integer> blockData = new HashMap<>();
+    private final Map<String, Integer> usersByUuid = new HashMap<>();
+    private final Map<String, String> userNames = new HashMap<>();
+    private final Map<String, Integer> usersByName = new HashMap<>();
+
+    public Consumer(Database database) {
+        this.database = database;
     }
 
-    private static Thread consumerThread = null;
-    private static final Object pauseMonitor = new Object();
-    private static boolean operationPaused = false;
-    private static boolean maintenancePaused = false;
-    private static final ReentrantReadWriteLock databaseLifecycle = new ReentrantReadWriteLock(true);
-    private static final Object rollbackPurgeGate = new Object();
-    private static long pendingRollbackPublications = 0;
-    private static volatile boolean backgroundPurgeRunning = false;
-    private static volatile boolean backgroundPurgePausesPersistence = false;
-    private static volatile boolean databaseReloadPaused = false;
-    private static volatile boolean databaseReloadRunning = false;
-    private static volatile boolean databaseReloadBlockedForShutdown = false;
-    private static CompletableFuture<Void> databaseReloadShutdownSignal = new CompletableFuture<>();
-    public static volatile int currentConsumer = 0;
-    public static volatile boolean isPaused = false;
-    public static volatile boolean transacting = false;
-    public static volatile boolean interrupt = false;
-    protected static volatile boolean pausedSuccess = false;
-    private static volatile boolean persistenceHalted = false;
+    public void start() {
+        thread = new Thread(this, "CoreProtect Consumer");
+        // Daemon so a stuck database can never keep the JVM alive; shutdown() joins it explicitly.
+        thread.setDaemon(true);
+        thread.start();
+    }
 
-    public static ConcurrentHashMap<Integer, ArrayList<Object[]>> consumer = new ConcurrentHashMap<>(4, 0.75f, 2);
-    // public static ConcurrentHashMap<Integer, Integer[]> consumer_id = new ConcurrentHashMap<>();
-    public static Map<Integer, Integer[]> consumer_id = Collections.synchronizedMap(new HashMap<>());
-    public static ConcurrentHashMap<Integer, Map<Integer, String[]>> consumerUsers = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, String>> consumerStrings = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, Object[]>> consumerSigns = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, ItemStack[]>> consumerContainers = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, Object>> consumerInventories = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<BlockState>>> consumerBlockList = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<Object[]>>> consumerObjectArrayList = new ConcurrentHashMap<>(4, 0.75f, 2);
-    @Deprecated
-    public static ConcurrentHashMap<Integer, Map<Integer, List<Object>>> consumerObjectList = new ConcurrentHashMap<>(4, 0.75f, 2);
+    public void queue(Entry entry) {
+        if (!running) {
+            return;
+        }
+        queue.add(entry);
+        queueSize.incrementAndGet();
+    }
 
-    public static ConcurrentHashMap<Integer, Map<Integer, Object>> consumerObjects = new ConcurrentHashMap<>(4, 0.75f, 2);
-    // ^merge maps into single object based map
+    public int queueSize() {
+        return queueSize.get();
+    }
 
-    private static void errorDelay() {
+    public long writtenRows() {
+        return written.get();
+    }
+
+    public boolean isPaused() {
+        return paused;
+    }
+
+    /** Pauses or resumes writing. Used while a purge holds the database. */
+    public void setPaused(boolean paused) {
+        this.paused = paused;
+        wake();
+    }
+
+    /**
+     * Returns a future that completes once every entry queued before this call has been written.
+     */
+    public CompletableFuture<Void> flush() {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+        if (!running) {
+            future.complete(null);
+            return future;
+        }
+        queue(new Entry.Flush(future));
+        flushRequested = true;
+        wake();
+        return future;
+    }
+
+    /** Waits (off the server thread only) for pending entries to be written. */
+    public void flushAndWait(long timeoutMs) {
         try {
-            Thread.sleep(30000); // 30 seconds
+            flush().get(timeoutMs, TimeUnit.MILLISECONDS);
         }
-        catch (Exception e) {
-            ErrorReporter.report(e);
-        }
-    }
-
-    protected static long reserveConsumer() {
-        return reserveConsumers(1);
-    }
-
-    protected static long reserveConsumers(int count) {
-        synchronized (Consumer.consumer_id) {
-            int consumer = Consumer.currentConsumer;
-            Integer[] state = Consumer.consumer_id.get(consumer);
-            int id = state[0];
-            Consumer.consumer_id.put(consumer, new Integer[] { id + count, state[1] + count });
-            return ((long) consumer << 32) | (id & 0xffffffffL);
+        catch (Exception ignored) {
+            // Lookups still work against whatever has been written so far.
         }
     }
 
-    protected static void completeReservation(long reservation, int count) {
-        int consumer = (int) (reservation >>> 32);
-        synchronized (Consumer.consumer_id) {
-            Integer[] state = Consumer.consumer_id.get(consumer);
-            if (count <= 0 || state == null || state[1] < count) {
-                throw new IllegalStateException("Invalid consumer reservation completion");
-            }
-            Consumer.consumer_id.put(consumer, new Integer[] { state[0], state[1] - count });
+    private void wake() {
+        synchronized (signal) {
+            signal.notifyAll();
         }
     }
 
-    public static int getConsumerSize(int id) {
-        if (id == 0 || id == 1) {
-            return Consumer.consumer.get(id).size();
-        }
-
-        return 0;
-    }
-
-    public static boolean hasPendingConsumerData() {
-        synchronized (consumer_id) {
-            for (int id = 0; id < 2; id++) {
-                Integer[] state = consumer_id.get(id);
-                ArrayList<Object[]> data = consumer.get(id);
-                if ((state != null && state[1] > 0) || (data != null && !data.isEmpty())) {
-                    return true;
-                }
-            }
-            return false;
-        }
-    }
-
-    public static void initialize() {
-        synchronized (rollbackPurgeGate) {
-            persistenceHalted = false;
-            pendingRollbackPublications = 0;
-            databaseReloadBlockedForShutdown = false;
-            databaseReloadShutdownSignal.complete(null);
-            databaseReloadShutdownSignal = new CompletableFuture<>();
-        }
-        synchronized (pauseMonitor) {
-            operationPaused = false;
-            maintenancePaused = false;
-            isPaused = false;
-            pauseMonitor.notifyAll();
-        }
-        databaseReloadPaused = false;
-        databaseReloadRunning = false;
-        backgroundPurgeRunning = false;
-        backgroundPurgePausesPersistence = false;
-        resetPreparationFailures();
-        DuckDBRecovery.reset();
-        Consumer.consumer.put(0, new ArrayList<>());
-        Consumer.consumer.put(1, new ArrayList<>());
-        Consumer.consumer_id.put(0, new Integer[] { 0, 0 });
-        Consumer.consumer_id.put(1, new Integer[] { 0, 0 });
-        Consumer.consumerUsers.put(0, new HashMap<>());
-        Consumer.consumerUsers.put(1, new HashMap<>());
-        Consumer.consumerObjects.put(0, new HashMap<>());
-        Consumer.consumerObjects.put(1, new HashMap<>());
-        Consumer.consumerStrings.put(0, new HashMap<>());
-        Consumer.consumerStrings.put(1, new HashMap<>());
-        Consumer.consumerSigns.put(0, new HashMap<>());
-        Consumer.consumerSigns.put(1, new HashMap<>());
-        Consumer.consumerInventories.put(0, new HashMap<>());
-        Consumer.consumerInventories.put(1, new HashMap<>());
-        Consumer.consumerBlockList.put(0, new HashMap<>());
-        Consumer.consumerBlockList.put(1, new HashMap<>());
-        Consumer.consumerObjectArrayList.put(0, new HashMap<>());
-        Consumer.consumerObjectArrayList.put(1, new HashMap<>());
-        Consumer.consumerObjectList.put(0, new HashMap<>());
-        Consumer.consumerObjectList.put(1, new HashMap<>());
-        Consumer.consumerContainers.put(0, new HashMap<>());
-        Consumer.consumerContainers.put(1, new HashMap<>());
-    }
-
-    public static boolean isRunning() {
-        return consumerThread != null && consumerThread.isAlive();
-    }
-
-    public static boolean isPersistenceHalted() {
-        return persistenceHalted;
-    }
-
-    public static boolean claimLookupPause() throws InterruptedException {
-        synchronized (pauseMonitor) {
-            while (isPaused && !persistenceHalted) {
-                pauseMonitor.wait(1L);
-            }
-            if (persistenceHalted) {
-                return false;
-            }
-            operationPaused = true;
-            isPaused = true;
-            return true;
-        }
-    }
-
-    public static boolean tryClaimConsumerPause() {
-        synchronized (pauseMonitor) {
-            if (isPaused || persistenceHalted) {
-                return false;
-            }
-            operationPaused = true;
-            isPaused = true;
-            return true;
-        }
-    }
-
-    public static void releaseOperationPause() {
-        synchronized (pauseMonitor) {
-            operationPaused = false;
-            isPaused = maintenancePaused;
-            pauseMonitor.notifyAll();
-        }
-    }
-
-    public static void setMaintenancePaused(boolean paused) {
-        synchronized (pauseMonitor) {
-            maintenancePaused = paused;
-            isPaused = operationPaused || maintenancePaused;
-            pauseMonitor.notifyAll();
-        }
-    }
-
-    public static void lockDatabaseAccess() {
-        databaseLifecycle.readLock().lock();
-    }
-
-    public static void unlockDatabaseAccess() {
-        databaseLifecycle.readLock().unlock();
-    }
-
-    public static void lockDatabaseMaintenance() {
-        databaseLifecycle.writeLock().lock();
-    }
-
-    public static void lockDatabaseMaintenanceInterruptibly() throws InterruptedException {
-        databaseLifecycle.writeLock().lockInterruptibly();
-    }
-
-    public static void unlockDatabaseMaintenance() {
-        databaseLifecycle.writeLock().unlock();
-    }
-
-    public static boolean isDatabaseReloadBlocked() {
-        return databaseReloadPaused && !databaseLifecycle.isWriteLockedByCurrentThread();
-    }
-
-    public static boolean isDatabaseReloadPaused() {
-        return databaseReloadPaused;
-    }
-
-    public static boolean isDatabaseReloadRunning() {
-        return databaseReloadRunning;
-    }
-
-    public static boolean isBackgroundPurgeRunning() {
-        return backgroundPurgeRunning;
-    }
-
-    public static void requireDatabaseReload() {
-        synchronized (rollbackPurgeGate) {
-            databaseReloadPaused = true;
-        }
-    }
-
-    public static OperationStartResult beginDatabaseReload() {
-        return beginDatabaseReload(false);
-    }
-
-    public static OperationStartResult beginDatabaseRecovery() {
-        return beginDatabaseReload(true);
-    }
-
-    private static OperationStartResult beginDatabaseReload(boolean allowActiveRollbacks) {
-        synchronized (rollbackPurgeGate) {
-            if (databaseReloadBlockedForShutdown) {
-                return OperationStartResult.INTERRUPTED;
-            }
-            if (persistenceHalted) {
-                return OperationStartResult.PERSISTENCE_HALTED;
-            }
-            if (databaseReloadRunning) {
-                return OperationStartResult.RELOAD_RUNNING;
-            }
-            if (ConfigHandler.purgeRunning || backgroundPurgeRunning) {
-                return OperationStartResult.PURGE_RUNNING;
-            }
-            if (!allowActiveRollbacks && (!ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0)) {
-                return OperationStartResult.ROLLBACK_RUNNING;
-            }
-            databaseReloadRunning = true;
-            databaseReloadPaused = true;
-        }
-        return OperationStartResult.STARTED;
-    }
-
-    public static void blockDatabaseReloadForShutdown() {
-        synchronized (rollbackPurgeGate) {
-            databaseReloadBlockedForShutdown = true;
-            databaseReloadShutdownSignal.complete(null);
-        }
-    }
-
-    public static CompletableFuture<Void> databaseReloadShutdownSignal() {
-        synchronized (rollbackPurgeGate) {
-            return databaseReloadShutdownSignal.copy();
-        }
-    }
-
-    public static void lockDatabaseReload() {
-        databaseLifecycle.writeLock().lock();
-    }
-
-    public static boolean lockDatabaseReload(long timeoutMillis) throws InterruptedException {
-        return databaseLifecycle.writeLock().tryLock(Math.max(0L, timeoutMillis), java.util.concurrent.TimeUnit.MILLISECONDS);
-    }
-
-    public static void endDatabaseReload(boolean resumePersistence) {
-        try {
-            if (databaseLifecycle.isWriteLockedByCurrentThread()) {
-                databaseLifecycle.writeLock().unlock();
-            }
-        }
-        finally {
-            synchronized (rollbackPurgeGate) {
-                if (resumePersistence) {
-                    databaseReloadPaused = false;
-                    if (!ConfigHandler.converterRunning) {
-                        setMaintenancePaused(false);
-                    }
-                }
-                databaseReloadRunning = false;
-            }
-        }
-    }
-
-    public static synchronized void haltPersistence() {
-        synchronized (rollbackPurgeGate) {
-            if (persistenceHalted) {
-                return;
-            }
-            persistenceHalted = true;
-        }
-        ConfigHandler.databaseReachable = false;
-        Chat.sendConsoleMessage(Color.RED + "[CoreProtect] " + Phrase.build(Phrase.DATABASE_PERSISTENCE_HALTED));
-        Chat.sendConsoleMessage(Color.RED + "[CoreProtect] " + Phrase.build(Phrase.DATABASE_QUEUE_LOSS));
-    }
-
-    public static OperationStartResult claimPurge() {
-        synchronized (rollbackPurgeGate) {
-            if (persistenceHalted) {
-                return OperationStartResult.PERSISTENCE_HALTED;
-            }
-            if (databaseReloadPaused) {
-                return OperationStartResult.RELOAD_RUNNING;
-            }
-            if (ConfigHandler.purgeRunning || backgroundPurgeRunning) {
-                return OperationStartResult.PURGE_RUNNING;
-            }
-            if (!ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0) {
-                return OperationStartResult.ROLLBACK_RUNNING;
-            }
-            ConfigHandler.purgeRunning = true;
-            return OperationStartResult.STARTED;
-        }
-    }
-
-    public static void releasePurge() {
-        synchronized (rollbackPurgeGate) {
-            ConfigHandler.purgeRunning = false;
-        }
-    }
-
-    public static OperationStartResult claimBackgroundPurge() {
-        boolean pausePersistence;
-        synchronized (rollbackPurgeGate) {
-            pausePersistence = ConfigHandler.databaseType.isClickHouse();
-            OperationStartResult result = beginBackgroundPurge(pausePersistence);
-            if (result != OperationStartResult.STARTED) {
-                return result;
-            }
-        }
-        return lockBackgroundPurge(pausePersistence);
-    }
-
-    public static OperationStartResult claimBackgroundPurge(boolean pausePersistence) {
-        synchronized (rollbackPurgeGate) {
-            OperationStartResult result = beginBackgroundPurge(pausePersistence);
-            if (result != OperationStartResult.STARTED) {
-                return result;
-            }
-        }
-        return lockBackgroundPurge(pausePersistence);
-    }
-
-    private static OperationStartResult beginBackgroundPurge(boolean pausePersistence) {
-        if (persistenceHalted) {
-            return OperationStartResult.PERSISTENCE_HALTED;
-        }
-        if (databaseReloadPaused) {
-            return OperationStartResult.RELOAD_RUNNING;
-        }
-        if (ConfigHandler.purgeRunning || backgroundPurgeRunning) {
-            return OperationStartResult.PURGE_RUNNING;
-        }
-        if (!ConfigHandler.activeRollbacks.isEmpty() || pendingRollbackPublications > 0) {
-            return OperationStartResult.ROLLBACK_RUNNING;
-        }
-        backgroundPurgeRunning = true;
-        backgroundPurgePausesPersistence = pausePersistence;
-        return OperationStartResult.STARTED;
-    }
-
-    private static OperationStartResult lockBackgroundPurge(boolean pausePersistence) {
-        if (pausePersistence) {
+    /**
+     * Stops accepting entries, writes everything that is still queued and closes the connection.
+     */
+    public void shutdown() {
+        running = false;
+        paused = false;
+        wake();
+        if (thread != null) {
             try {
-                databaseLifecycle.writeLock().lockInterruptibly();
+                thread.join(TimeUnit.MINUTES.toMillis(5));
             }
-            catch (InterruptedException exception) {
-                synchronized (rollbackPurgeGate) {
-                    backgroundPurgePausesPersistence = false;
-                    backgroundPurgeRunning = false;
-                }
+            catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
-                return OperationStartResult.INTERRUPTED;
             }
-            synchronized (rollbackPurgeGate) {
-                if (persistenceHalted) {
-                    databaseLifecycle.writeLock().unlock();
-                    backgroundPurgePausesPersistence = false;
-                    backgroundPurgeRunning = false;
-                    return OperationStartResult.PERSISTENCE_HALTED;
-                }
-            }
-        }
-        return OperationStartResult.STARTED;
-    }
-
-    public static void releaseBackgroundPurge() {
-        synchronized (rollbackPurgeGate) {
-            if (!backgroundPurgeRunning) {
-                return;
-            }
-            if (backgroundPurgePausesPersistence) {
-                databaseLifecycle.writeLock().unlock();
-            }
-            backgroundPurgePausesPersistence = false;
-            backgroundPurgeRunning = false;
-        }
-    }
-
-    public static OperationStartResult claimRollback(String user) {
-        return claimRollback(user, true);
-    }
-
-    public static OperationStartResult claimRollback(String user, boolean requiresPersistence) {
-        synchronized (rollbackPurgeGate) {
-            if (requiresPersistence && persistenceHalted) {
-                return OperationStartResult.PERSISTENCE_HALTED;
-            }
-            if (databaseReloadPaused) {
-                return OperationStartResult.RELOAD_RUNNING;
-            }
-            if (ConfigHandler.purgeRunning || backgroundPurgeRunning) {
-                return OperationStartResult.PURGE_RUNNING;
-            }
-            if (ConfigHandler.activeRollbacks.containsKey(user)) {
-                return OperationStartResult.ROLLBACK_RUNNING;
-            }
-            ConfigHandler.activeRollbacks.put(user, true);
-            return OperationStartResult.STARTED;
-        }
-    }
-
-    public static void releaseRollback(String user) {
-        synchronized (rollbackPurgeGate) {
-            ConfigHandler.activeRollbacks.remove(user);
-        }
-    }
-
-    public static void registerRollbackPublications(int count) {
-        if (count <= 0) {
-            return;
-        }
-        synchronized (rollbackPurgeGate) {
-            pendingRollbackPublications += count;
-        }
-    }
-
-    public static void completeRollbackPublications(int count) {
-        if (count <= 0) {
-            return;
-        }
-        synchronized (rollbackPurgeGate) {
-            if (pendingRollbackPublications < count) {
-                throw new IllegalStateException("Invalid rollback publication completion");
-            }
-            pendingRollbackPublications -= count;
-        }
-    }
-
-    private static boolean isShutdownDrainStopped() {
-        return databaseReloadBlockedForShutdown && !ConfigHandler.shutdownDrainRunning;
-    }
-
-    private static boolean pauseConsumer(int process_id) throws InterruptedException {
-        try {
-            while (Consumer.consumer_id.get(process_id)[1] > 0 || Consumer.isPaused
-                    || ((ConfigHandler.serverRunning || ConfigHandler.converterRunning || ConfigHandler.migrationRunning) && (ConfigHandler.pauseConsumer || ConfigHandler.purgeRunning))) {
-                if (persistenceHalted || isShutdownDrainStopped()) {
-                    return false;
-                }
-                pausedSuccess = true;
-                Thread.sleep(100);
-            }
-            return !persistenceHalted && !isShutdownDrainStopped();
-        }
-        finally {
-            pausedSuccess = false;
-        }
-    }
-
-    private static boolean lockConsumerDatabase(Lock lock) throws InterruptedException {
-        while (!persistenceHalted && !isShutdownDrainStopped()) {
-            if (lock.tryLock(100L, TimeUnit.MILLISECONDS)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    static void processConsumerBatch(int processId, boolean lastRun) throws InterruptedException {
-        Lock databaseLock = databaseLifecycle.readLock();
-        if (!lockConsumerDatabase(databaseLock)) {
-            return;
-        }
-        try {
-            boolean exclusive = requiresEntityUuidMaintenance(processId);
-            if (exclusive) {
-                databaseLock.unlock();
-                databaseLock = null;
-                Lock writeLock = databaseLifecycle.writeLock();
-                if (!lockConsumerDatabase(writeLock)) {
-                    return;
-                }
-                databaseLock = writeLock;
-            }
-            if (databaseReloadPaused || isPaused || persistenceHalted || isShutdownDrainStopped()) {
-                return;
-            }
-            if (exclusive && !Database.awaitConnectionDrain(0L)) {
-                return;
-            }
-            Process.processConsumer(processId, lastRun);
-        }
-        finally {
-            if (databaseLock != null) {
-                databaseLock.unlock();
+            if (thread.isAlive()) {
+                CoreProtect.LOGGER.error("CoreProtect consumer did not finish within 5 minutes; {} entries were not saved", queueSize.get());
             }
         }
     }
 
     @Override
     public void run() {
-        boolean lastRun = false;
-        boolean[] drained = { true, true };
-
-        while (!isShutdownDrainStopped()
-                && (ConfigHandler.serverRunning || ConfigHandler.converterRunning || !lastRun || hasPendingConsumerData())) {
-            if (!ConfigHandler.serverRunning && !ConfigHandler.converterRunning) {
-                lastRun = true;
-            }
-            if (persistenceHalted) {
-                if (lastRun) {
-                    break;
-                }
-                if (databaseReloadBlockedForShutdown) {
-                    LockSupport.parkNanos(100_000_000L);
-                }
-                else {
-                    errorDelay();
-                }
-                continue;
-            }
+        List<Entry> batch = new ArrayList<>();
+        long lastErrorLog = 0;
+        int shutdownFailures = 0;
+        while (true) {
             try {
-                if (DuckDBRecovery.isPending()) {
-                    DuckDBRecovery.recoverIfRequested();
-                    if (DuckDBRecovery.isPending()) {
-                        Thread.sleep(500L);
+                if (batch.isEmpty()) {
+                    if (running && (paused || !flushRequested)) {
+                        // Let entries accumulate so they are written in a single transaction.
+                        synchronized (signal) {
+                            if (running && (paused || !flushRequested)) {
+                                signal.wait(IDLE_WAIT_MS);
+                            }
+                        }
+                        if (paused && running) {
+                            continue;
+                        }
+                    }
+                    flushRequested = false;
+                    Entry entry;
+                    while (batch.size() < MAX_BATCH && (entry = queue.poll()) != null) {
+                        batch.add(entry);
+                    }
+                    queueSize.addAndGet(-batch.size());
+                    if (batch.isEmpty()) {
+                        if (!running) {
+                            break;
+                        }
                         continue;
                     }
-                }
-                int process_id = 0;
-                synchronized (Consumer.consumer_id) {
-                    if (currentConsumer == 0) {
-                        currentConsumer = 1;
-                    }
-                    else {
-                        process_id = 1;
-                        currentConsumer = 0;
+                    if (!queue.isEmpty()) {
+                        flushRequested = true;
                     }
                 }
-                Thread.sleep(consumerDelay(lastRun || !drained[0] || !drained[1]));
-                if (!pauseConsumer(process_id)) {
-                    continue;
-                }
-                try {
-                    processConsumerBatch(process_id, lastRun);
-                }
-                finally {
-                    drained[process_id] = getConsumerSize(process_id) == 0;
-                }
+                write(batch);
+                completeFlushes(batch);
+                batch.clear();
             }
             catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             }
-            catch (Exception e) {
-                ErrorReporter.report(e);
-                if (ConfigHandler.serverRunning || ConfigHandler.converterRunning) {
-                    errorDelay();
+            catch (Throwable e) {
+                closeConnection();
+                long now = System.currentTimeMillis();
+                if (now - lastErrorLog > 60_000 || !running) {
+                    CoreProtect.LOGGER.error("CoreProtect was unable to write to the database; retrying", e);
+                    lastErrorLog = now;
                 }
+                if (!running && ++shutdownFailures >= 3) {
+                    CoreProtect.LOGGER.error("Discarding {} unsaved CoreProtect entries during shutdown", batch.size() + queueSize.get());
+                    break;
+                }
+                try {
+                    Thread.sleep(running ? 5000 : 1000);
+                }
+                catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }
+        completeFlushes(batch);
+        Entry entry;
+        while ((entry = queue.poll()) != null) {
+            if (entry instanceof Entry.Flush flush) {
+                flush.future().complete(null);
+            }
+        }
+        closeConnection();
+    }
+
+    private static void completeFlushes(List<Entry> batch) {
+        for (Entry entry : batch) {
+            if (entry instanceof Entry.Flush flush) {
+                flush.future().complete(null);
             }
         }
     }
 
-    @Override
-    public void uncaughtException(Thread thread, Throwable e) {
-        ErrorReporter.report(e);
-        Bukkit.getPluginManager().disablePlugin(CoreProtect.getInstance());
+    private void closeConnection() {
+        if (connection != null) {
+            try {
+                connection.close();
+            }
+            catch (SQLException ignored) {
+            }
+            connection = null;
+            // Cached ids may belong to a transaction that was rolled back.
+            worlds.clear();
+            materials.clear();
+            blockData.clear();
+            usersByUuid.clear();
+            usersByName.clear();
+            userNames.clear();
+        }
     }
 
-    public static void startConsumer() {
-        if (!isRunning()) {
-            consumerThread = new Thread(new Consumer());
-            consumerThread.setUncaughtExceptionHandler(new Consumer());
-            consumerThread.start();
+    private void write(List<Entry> batch) throws SQLException {
+        if (connection == null) {
+            connection = database.connect();
+            connection.setAutoCommit(false);
+        }
+        try (Statements s = new Statements(connection)) {
+            for (Entry entry : batch) {
+                if (entry instanceof Entry.Login login) {
+                    login(login);
+                }
+                else if (entry instanceof Entry.Block e) {
+                    PreparedStatement ps = s.block();
+                    ps.setLong(1, e.time());
+                    ps.setInt(2, user(e.actor()));
+                    location(ps, 3, e.location());
+                    ps.setInt(7, material(e.type()));
+                    ps.setInt(8, e.data() == null ? 0 : blockData(e.data()));
+                    blob(ps, 9, NbtCodec.encode(e.meta()));
+                    ps.setInt(10, e.action());
+                    ps.addBatch();
+                }
+                else if (entry instanceof Entry.Container e) {
+                    PreparedStatement ps = s.container();
+                    ps.setLong(1, e.time());
+                    ps.setInt(2, user(e.actor()));
+                    location(ps, 3, e.location());
+                    ps.setInt(7, material(e.type()));
+                    ps.setInt(8, e.slot());
+                    ps.setInt(9, e.amount());
+                    blob(ps, 10, NbtCodec.encode(e.tag()));
+                    ps.setInt(11, e.action());
+                    ps.addBatch();
+                }
+                else if (entry instanceof Entry.Item e) {
+                    PreparedStatement ps = s.item();
+                    ps.setLong(1, e.time());
+                    ps.setInt(2, user(e.actor()));
+                    location(ps, 3, e.location());
+                    ps.setInt(7, material(e.type()));
+                    ps.setInt(8, e.amount());
+                    blob(ps, 9, NbtCodec.encode(e.tag()));
+                    ps.setInt(10, e.action());
+                    ps.addBatch();
+                }
+                else if (entry instanceof Entry.Chat e) {
+                    message(s.chat(), e.time(), e.actor(), e.location(), e.message());
+                }
+                else if (entry instanceof Entry.Command e) {
+                    message(s.command(), e.time(), e.actor(), e.location(), e.message());
+                }
+                else if (entry instanceof Entry.Session e) {
+                    PreparedStatement ps = s.session();
+                    ps.setLong(1, e.time());
+                    ps.setInt(2, user(e.actor()));
+                    location(ps, 3, e.location());
+                    ps.setInt(7, e.action());
+                    ps.addBatch();
+                }
+                else if (entry instanceof Entry.Sign e) {
+                    PreparedStatement ps = s.sign();
+                    ps.setLong(1, e.time());
+                    ps.setInt(2, user(e.actor()));
+                    location(ps, 3, e.location());
+                    ps.setInt(7, e.side());
+                    ps.setString(8, e.text());
+                    ps.addBatch();
+                }
+            }
+            int rows = s.executeAll();
+            connection.commit();
+            written.addAndGet(rows);
+        }
+        catch (SQLException | RuntimeException e) {
+            try {
+                connection.rollback();
+            }
+            catch (SQLException ignored) {
+            }
+            throw e;
+        }
+    }
+
+    private void message(PreparedStatement ps, long time, Entry.Actor actor, Entry.Location location, String message) throws SQLException {
+        ps.setLong(1, time);
+        ps.setInt(2, user(actor));
+        location(ps, 3, location);
+        ps.setString(7, message);
+        ps.addBatch();
+    }
+
+    private void location(PreparedStatement ps, int index, Entry.Location location) throws SQLException {
+        ps.setInt(index, world(location.world()));
+        ps.setInt(index + 1, location.x());
+        ps.setInt(index + 2, location.y());
+        ps.setInt(index + 3, location.z());
+    }
+
+    private static void blob(PreparedStatement ps, int index, byte[] data) throws SQLException {
+        if (data == null) {
+            ps.setNull(index, Types.BLOB);
+        }
+        else {
+            ps.setBytes(index, data);
+        }
+    }
+
+    private int world(String name) throws SQLException {
+        return mapId(worlds, "world", "world", name);
+    }
+
+    private int material(String name) throws SQLException {
+        return mapId(materials, "material_map", "material", name);
+    }
+
+    private int blockData(String data) throws SQLException {
+        return mapId(blockData, "blockdata_map", "data", data);
+    }
+
+    private int mapId(Map<String, Integer> cache, String table, String column, String value) throws SQLException {
+        Integer id = cache.get(value);
+        if (id != null) {
+            return id;
+        }
+        try (PreparedStatement ps = connection.prepareStatement("SELECT id FROM " + database.table(table) + " WHERE " + column + " = ? ORDER BY id LIMIT 1")) {
+            ps.setString(1, value);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    id = rs.getInt(1);
+                }
+            }
+        }
+        if (id == null) {
+            try (PreparedStatement ps = connection.prepareStatement("INSERT INTO " + database.table(table) + " (" + column + ") VALUES (?)", Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, value);
+                ps.executeUpdate();
+                id = generatedKey(ps);
+            }
+        }
+        cache.put(value, id);
+        return id;
+    }
+
+    private static int generatedKey(PreparedStatement ps) throws SQLException {
+        try (ResultSet keys = ps.getGeneratedKeys()) {
+            if (keys.next()) {
+                return (int) keys.getLong(1);
+            }
+        }
+        throw new SQLException("No generated key returned");
+    }
+
+    private int user(Entry.Actor actor) throws SQLException {
+        if (actor.uuid() != null) {
+            String uuid = actor.uuid().toString();
+            Integer id = usersByUuid.get(uuid);
+            if (id != null) {
+                return id;
+            }
+            try (PreparedStatement ps = connection.prepareStatement("SELECT id, user FROM " + database.table("user") + " WHERE uuid = ? ORDER BY id LIMIT 1")) {
+                ps.setString(1, uuid);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        id = rs.getInt(1);
+                        userNames.put(uuid, rs.getString(2));
+                    }
+                }
+            }
+            if (id == null) {
+                id = insertUser(actor.name(), uuid, actor.name());
+            }
+            usersByUuid.put(uuid, id);
+            return id;
+        }
+
+        String key = actor.name().toLowerCase(Locale.ROOT);
+        Integer id = usersByName.get(key);
+        if (id != null) {
+            return id;
+        }
+        try (PreparedStatement ps = connection.prepareStatement("SELECT id FROM " + database.table("user") + " WHERE user = ? AND uuid IS NULL ORDER BY id LIMIT 1")) {
+            ps.setString(1, actor.name());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    id = rs.getInt(1);
+                }
+            }
+        }
+        if (id == null) {
+            id = insertUser(actor.name(), null, null);
+        }
+        usersByName.put(key, id);
+        return id;
+    }
+
+    private int insertUser(String name, String uuid, String logName) throws SQLException {
+        long now = System.currentTimeMillis() / 1000L;
+        int id;
+        try (PreparedStatement ps = connection.prepareStatement("INSERT INTO " + database.table("user") + " (time, user, uuid) VALUES (?, ?, ?)", Statement.RETURN_GENERATED_KEYS)) {
+            ps.setLong(1, now);
+            ps.setString(2, name);
+            ps.setString(3, uuid);
+            ps.executeUpdate();
+            id = generatedKey(ps);
+        }
+        if (uuid != null) {
+            userNames.put(uuid, name);
+            logUsername(now, uuid, logName);
+        }
+        return id;
+    }
+
+    private void logUsername(long time, String uuid, String name) throws SQLException {
+        try (PreparedStatement ps = connection.prepareStatement("INSERT INTO " + database.table("username_log") + " (time, uuid, user) VALUES (?, ?, ?)")) {
+            ps.setLong(1, time);
+            ps.setString(2, uuid);
+            ps.setString(3, name);
+            ps.executeUpdate();
+        }
+    }
+
+    private void login(Entry.Login login) throws SQLException {
+        int id = user(login.actor());
+        String uuid = login.actor().uuid().toString();
+        String known = userNames.get(uuid);
+        if (known != null && !known.equals(login.actor().name())) {
+            try (PreparedStatement ps = connection.prepareStatement("UPDATE " + database.table("user") + " SET user = ? WHERE id = ?")) {
+                ps.setString(1, login.actor().name());
+                ps.setInt(2, id);
+                ps.executeUpdate();
+            }
+            logUsername(login.time(), uuid, login.actor().name());
+            userNames.put(uuid, login.actor().name());
+        }
+    }
+
+    /** Lazily prepared insert statements for one transaction. */
+    private final class Statements implements AutoCloseable {
+        private final Connection connection;
+        private PreparedStatement block, container, item, chat, command, session, sign;
+        private final List<PreparedStatement> used = new ArrayList<>();
+
+        Statements(Connection connection) {
+            this.connection = connection;
+        }
+
+        private PreparedStatement prepare(String sql) throws SQLException {
+            PreparedStatement ps = connection.prepareStatement(sql);
+            used.add(ps);
+            return ps;
+        }
+
+        private static final String LOCATION = "time, user, wid, x, y, z";
+
+        PreparedStatement block() throws SQLException {
+            if (block == null) {
+                block = prepare("INSERT INTO " + database.table("block") + " (" + LOCATION + ", type, data, meta, action, rolled_back) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
+            }
+            return block;
+        }
+
+        PreparedStatement container() throws SQLException {
+            if (container == null) {
+                container = prepare("INSERT INTO " + database.table("container") + " (" + LOCATION + ", type, slot, amount, metadata, action, rolled_back) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)");
+            }
+            return container;
+        }
+
+        PreparedStatement item() throws SQLException {
+            if (item == null) {
+                item = prepare("INSERT INTO " + database.table("item") + " (" + LOCATION + ", type, amount, metadata, action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            }
+            return item;
+        }
+
+        PreparedStatement chat() throws SQLException {
+            if (chat == null) {
+                chat = prepare("INSERT INTO " + database.table("chat") + " (" + LOCATION + ", message) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            }
+            return chat;
+        }
+
+        PreparedStatement command() throws SQLException {
+            if (command == null) {
+                command = prepare("INSERT INTO " + database.table("command") + " (" + LOCATION + ", message) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            }
+            return command;
+        }
+
+        PreparedStatement session() throws SQLException {
+            if (session == null) {
+                session = prepare("INSERT INTO " + database.table("session") + " (" + LOCATION + ", action) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            }
+            return session;
+        }
+
+        PreparedStatement sign() throws SQLException {
+            if (sign == null) {
+                sign = prepare("INSERT INTO " + database.table("sign") + " (" + LOCATION + ", side, text) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            }
+            return sign;
+        }
+
+        int executeAll() throws SQLException {
+            int rows = 0;
+            for (PreparedStatement ps : used) {
+                for (int count : ps.executeBatch()) {
+                    rows += Math.max(count, 1);
+                }
+            }
+            return rows;
+        }
+
+        @Override
+        public void close() {
+            for (PreparedStatement ps : used) {
+                try {
+                    ps.close();
+                }
+                catch (SQLException ignored) {
+                }
+            }
         }
     }
 }

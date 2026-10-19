@@ -1,0 +1,17 @@
+{
+  "required": true,
+  "minVersion": "0.8",
+  "package": "net.coreprotect.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "coreprotect.refmap.json",
+  "mixins": [
+    "BreakDoorGoalMixin",
+    "EndermanTakeBlockGoalMixin",
+    "FireBlockMixin",
+    "LeavesBlockMixin",
+    "SignBlockEntityMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}
